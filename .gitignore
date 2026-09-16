@@ -1,0 +1,9 @@
+.claude/telegram.env
+.claude/sessions/
+.claude/projects/
+.claude/history.jsonl
+.claude/file-history/
+.claude/backups/
+.claude/shell-snapshots/
+.claude.json
+.local/
