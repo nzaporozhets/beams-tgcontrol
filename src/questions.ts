@@ -4,6 +4,7 @@ import type { InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TgCall
 
 interface QuestionSlot {
   index: number;
+  agentName: string;
   question: string;
   header: string;
   options: { label: string; description: string }[];
@@ -17,6 +18,7 @@ interface QuestionSlot {
 
 interface PendingBatch {
   id: string;
+  agentName: string;
   input: AskUserQuestionInput;
   slots: QuestionSlot[];
   resolve: (output: AskUserQuestionOutput) => void;
@@ -29,8 +31,11 @@ function randomId(): string {
   return randomBytes(4).toString('hex');
 }
 
-function questionText(q: { question: string; options: { label: string; description: string }[] }): string {
-  const lines = [`❓ ${q.question}`, ''];
+function questionText(
+  agentName: string,
+  q: { question: string; options: { label: string; description: string }[] },
+): string {
+  const lines = [`[${agentName}] ❓ ${q.question}`, ''];
   for (const opt of q.options) lines.push(`• ${opt.label} — ${opt.description}`);
   return lines.join('\n');
 }
@@ -76,7 +81,7 @@ export class QuestionManager {
     });
   }
 
-  async ask(input: AskUserQuestionInput): Promise<AskUserQuestionOutput> {
+  async ask(input: AskUserQuestionInput, agentName: string): Promise<AskUserQuestionOutput> {
     const chatId = this.getChatId();
     if (chatId === null) {
       throw new Error('cannot ask a question before the operator chat is bound');
@@ -87,6 +92,7 @@ export class QuestionManager {
       const q = input.questions[i];
       const slot: QuestionSlot = {
         index: i,
+        agentName,
         question: q.question,
         header: q.header,
         options: q.options as { label: string; description: string }[],
@@ -97,7 +103,7 @@ export class QuestionManager {
         answered: false,
       };
       const markup = buildMarkup(slot, batchId);
-      const msg = await this.tg.sendMessage(chatId, questionText(q), { reply_markup: markup });
+      const msg = await this.tg.sendMessage(chatId, questionText(agentName, q), { reply_markup: markup });
       slot.messageId = msg.message_id;
       slots.push(slot);
     }
@@ -107,9 +113,9 @@ export class QuestionManager {
         const batch = this.pending.get(batchId);
         if (!batch) return;
         const headers = batch.slots.filter((s) => !s.answered).map((s) => s.header).join(', ');
-        this.notify(`⏳ Still waiting on your answer: ${headers}`);
+        this.notify(`⏳ [${batch.agentName}] Still waiting on your answer: ${headers}`);
       }, PING_MS);
-      this.pending.set(batchId, { id: batchId, input, slots, resolve, pingTimer });
+      this.pending.set(batchId, { id: batchId, agentName, input, slots, resolve, pingTimer });
     });
   }
 
@@ -125,7 +131,7 @@ export class QuestionManager {
   private async finalizeSlot(slot: QuestionSlot, answerText: string): Promise<void> {
     slot.answered = true;
     slot.answerText = answerText;
-    await this.tg.editMessageText(slot.chatId, slot.messageId, `✅ ${slot.question}\n${answerText}`, {
+    await this.tg.editMessageText(slot.chatId, slot.messageId, `✅ [${slot.agentName}] ${slot.question}\n${answerText}`, {
       reply_markup: { inline_keyboard: [] },
     });
   }

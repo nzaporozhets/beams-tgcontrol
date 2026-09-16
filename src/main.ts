@@ -3,11 +3,11 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { EffortLevel, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import { AgentSession } from './agent.js';
-import { Checkpoint } from './checkpoint.js';
+import type { EffortLevel } from '@anthropic-ai/claude-agent-sdk';
+import { TTLScheduler } from './checkpoint.js';
 import { COMMAND_LIST, CommandRouter } from './commands.js';
 import { QuestionManager } from './questions.js';
+import { AgentRegistry } from './registry.js';
 import { StateStore } from './state.js';
 import { TelegramClient, type TgMessage } from './telegram.js';
 
@@ -50,131 +50,6 @@ async function readBeamExpiry(uuid: string | undefined): Promise<Date | null> {
   } catch (err) {
     console.error('[main] tsh beams ls failed, TTL warnings disabled:', err);
     return null;
-  }
-}
-
-function toolLabel(name: string, input: Record<string, unknown>): string {
-  const short = (s: unknown, n = 50) => String(s ?? '').replace(/\s+/g, ' ').slice(0, n);
-  switch (name) {
-    case 'Bash':
-      return `Bash ${short(input.command)}`;
-    case 'Edit':
-    case 'Write':
-    case 'Read':
-      return `${name} ${String(input.file_path ?? '').split('/').pop() ?? ''}`;
-    default:
-      return name;
-  }
-}
-
-/**
- * Coalesces one agent turn's worth of SDKMessages into a single Telegram
- * message: a collapsed tool-call line, then the running assistant text,
- * edited at most every 3s and finalized at `result` (§5.3).
- */
-class TurnRenderer {
-  private chatId: number | null = null;
-  private messageId: number | null = null;
-  private toolLines: string[] = [];
-  private text = '';
-  private dirty = false;
-  private lastEditAt = 0;
-  private pendingTimer: NodeJS.Timeout | null = null;
-
-  constructor(private tg: TelegramClient, private getChatId: () => number | null) {}
-
-  handle(msg: SDKMessage): void {
-    if (msg.type === 'assistant') {
-      for (const block of msg.message.content) {
-        if (block.type === 'tool_use') {
-          this.toolLines.push(`🔧 ${toolLabel(block.name, block.input as Record<string, unknown>)}`);
-          this.dirty = true;
-        } else if (block.type === 'text') {
-          this.text += (this.text ? '\n' : '') + block.text;
-          this.dirty = true;
-        }
-      }
-      this.scheduleEdit();
-    } else if (msg.type === 'user') {
-      this.handleToolResult(msg);
-    } else if (msg.type === 'result') {
-      void this.finish(msg.is_error ? `⚠️ turn ended with an error (${msg.subtype})` : undefined);
-    }
-  }
-
-  private handleToolResult(msg: Extract<SDKMessage, { type: 'user' }>): void {
-    const content = msg.message.content;
-    if (!Array.isArray(content)) return;
-    for (const block of content) {
-      if (block.type !== 'tool_result') continue;
-      const text = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-      if (text.length > 800) {
-        const chatId = this.getChatId();
-        if (chatId === null) continue;
-        const preview = text.slice(0, 500);
-        void this.tg
-          .sendDocument(chatId, 'tool-output.txt', text, `${preview.slice(0, 200)}${text.length > 200 ? '…' : ''}`)
-          .catch((err) => console.error('[render] sendDocument failed:', err));
-      }
-    }
-  }
-
-  private render(): string {
-    const parts: string[] = [];
-    if (this.toolLines.length) parts.push(this.toolLines.join(' · '));
-    if (this.text) parts.push(this.text);
-    const joined = parts.join('\n\n') || '…';
-    return joined.length > 3800 ? `${joined.slice(0, 3800)}…` : joined;
-  }
-
-  private scheduleEdit(): void {
-    if (!this.dirty) return;
-    const now = Date.now();
-    if (now - this.lastEditAt >= 3000) {
-      void this.flush();
-      return;
-    }
-    if (this.pendingTimer) return;
-    this.pendingTimer = setTimeout(() => {
-      this.pendingTimer = null;
-      void this.flush();
-    }, 3000 - (now - this.lastEditAt));
-  }
-
-  private async flush(): Promise<void> {
-    if (!this.dirty) return;
-    const chatId = this.getChatId();
-    if (chatId === null) return;
-    this.dirty = false;
-    this.lastEditAt = Date.now();
-    const text = this.render();
-    try {
-      if (this.messageId === null || this.chatId !== chatId) {
-        const sent = await this.tg.sendMessage(chatId, text);
-        this.chatId = chatId;
-        this.messageId = sent.message_id;
-      } else {
-        await this.tg.editMessageText(chatId, this.messageId, text);
-      }
-    } catch (err) {
-      console.error('[render] flush failed:', err);
-    }
-  }
-
-  private async finish(errorNote?: string): Promise<void> {
-    if (this.pendingTimer) {
-      clearTimeout(this.pendingTimer);
-      this.pendingTimer = null;
-    }
-    if (errorNote) {
-      this.text += (this.text ? '\n\n' : '') + errorNote;
-      this.dirty = true;
-    }
-    await this.flush();
-    this.chatId = null;
-    this.messageId = null;
-    this.toolLines = [];
-    this.text = '';
   }
 }
 
@@ -235,26 +110,48 @@ async function main(): Promise<void> {
   };
 
   const questions = new QuestionManager(tg, getChatId, notify);
-  const renderer = new TurnRenderer(tg, getChatId);
 
-  const agent = new AgentSession(
-    {
-      cwd: workDir,
-      model: process.env.CLAUDE_MODEL ?? 'opus',
-      fallbackModel: process.env.CLAUDE_FALLBACK_MODEL ?? 'sonnet',
-      effort: (process.env.CLAUDE_EFFORT as EffortLevel) ?? 'high',
-      appendSystemPrompt: SYSTEM_PROMPT_APPEND,
-    },
-    questions,
-    state,
-    (msg) => renderer.handle(msg),
-    (text) => notify(text),
-  );
+  const defaultModel = process.env.CLAUDE_MODEL ?? 'opus';
+  const defaultFallbackModel = process.env.CLAUDE_FALLBACK_MODEL ?? 'sonnet';
+  const defaultEffort = (process.env.CLAUDE_EFFORT as EffortLevel) ?? 'high';
 
-  const checkpoint = new Checkpoint({ workDir, beamAlias, expiresAt, notify });
-  checkpoint.start();
+  const registry = new AgentRegistry(tg, questions, state, getChatId, notify, {
+    model: defaultModel,
+    fallbackModel: defaultFallbackModel,
+    effort: defaultEffort,
+    workDirBase: workDir,
+    appendSystemPrompt: SYSTEM_PROMPT_APPEND,
+    beamAlias,
+  });
 
-  new CommandRouter(tg, agent, checkpoint, { alias: beamAlias, expiresAt, tmuxSession, logPath }, getChatId);
+  const persistedAgents = Object.entries(state.get().agents);
+  if (persistedAgents.length === 0) {
+    // Fresh install: zero-config single-agent path, matching v0's behavior exactly.
+    registry.spawn('default', { cwd: workDir, model: defaultModel, fallbackModel: defaultFallbackModel, effort: defaultEffort });
+  } else {
+    for (const [name, agentState] of persistedAgents) {
+      if (agentState.status !== 'running') continue; // deliberately stopped -- don't auto-resume
+      registry.spawn(name, {
+        cwd: agentState.cwd || workDir,
+        model: agentState.model || defaultModel,
+        fallbackModel: defaultFallbackModel,
+        effort: agentState.effort || defaultEffort,
+        resume: agentState.sessionId ?? undefined,
+      });
+    }
+    const persistedFocused = state.get().focused;
+    if (persistedFocused && registry.get(persistedFocused)) registry.setFocused(persistedFocused);
+  }
+
+  const ttlScheduler = new TTLScheduler({
+    expiresAt,
+    beamAlias,
+    notify,
+    getCheckpoints: () => registry.list().map((e) => e.checkpoint),
+  });
+  ttlScheduler.start();
+
+  new CommandRouter(tg, registry, { alias: beamAlias, expiresAt, tmuxSession, logPath }, getChatId);
 
   tg.on('message', (msg: TgMessage) => {
     if (msg.chat.id !== chatId) return; // only the bound operator chat
@@ -264,14 +161,26 @@ async function main(): Promise<void> {
     }
     if (msg.text?.startsWith('/')) return; // handled by CommandRouter
     if (msg.reply_to_message) return; // handled by QuestionManager (typed answer) or dropped
-    if (msg.text) agent.send(msg.text);
+    if (!msg.text) return;
+    const focused = registry.getFocused();
+    if (!focused) {
+      tg.sendMessage(chatId, 'no focused agent — /switch <name> or /new <name>').catch((err) =>
+        console.error('[main] reply failed:', err),
+      );
+      return;
+    }
+    focused.agent.send(msg.text);
   });
 
-  const opts = agent.getOptions();
   const ttl = expiresAt ? expiresAt.toISOString() : 'unknown';
-  const greeting = wasBound
-    ? `Reconnected — ${beamAlias}\n${opts.cwd} · ${opts.model} · effort ${opts.effort}\nexpires ${ttl}`
-    : `Connected — ${beamAlias}\n${opts.cwd} · ${opts.model} · effort ${opts.effort}\nexpires ${ttl}`;
+  const agentLines = registry
+    .list()
+    .map((e) => {
+      const o = e.agent.getOptions();
+      return `${e.name === registry.getFocusedName() ? '★' : ' '} ${e.name} · ${o.cwd} · ${o.model} · effort ${o.effort}`;
+    })
+    .join('\n');
+  const greeting = `${wasBound ? 'Reconnected' : 'Connected'} — ${beamAlias}\nexpires ${ttl}\n\n${agentLines}`;
   await tg.sendMessage(chatId, greeting);
 }
 

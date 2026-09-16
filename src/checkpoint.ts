@@ -8,50 +8,34 @@ const WARN_AT_MS = [60 * 60 * 1000, 15 * 60 * 1000];
 
 export interface CheckpointOptions {
   workDir: string;
-  beamAlias: string;
-  expiresAt: Date | null;
-  notify: (text: string) => void;
+  refName: string;
 }
 
 /**
- * §6 survival net: push everything dirty in `workDir` every 15 minutes, and
- * push-then-warn at T-60m and T-15m before the beam is purged.
+ * §6 survival net, per agent: push everything dirty in `workDir` to `refName`
+ * every 15 minutes. TTL warnings (T-60m/T-15m) are handled beam-wide by
+ * `TTLScheduler`, not here -- one warning message per beam, not one per agent.
  */
 export class Checkpoint {
   private interval?: NodeJS.Timeout;
-  private warnTimers: NodeJS.Timeout[] = [];
 
   constructor(private opts: CheckpointOptions) {}
 
   start(): void {
     this.interval = setInterval(() => {
-      this.pushIfDirty('periodic checkpoint').catch((err) => console.error('[checkpoint] periodic push failed:', err));
+      this.pushIfDirty('periodic checkpoint').catch((err) =>
+        console.error(`[checkpoint:${this.opts.refName}] periodic push failed:`, err),
+      );
     }, INTERVAL_MS);
-
-    if (!this.opts.expiresAt) return;
-    const expiresAt = this.opts.expiresAt;
-    for (const warnBefore of WARN_AT_MS) {
-      const delay = expiresAt.getTime() - warnBefore - Date.now();
-      if (delay <= 0) continue;
-      const timer = setTimeout(() => {
-        const minsLeft = Math.round(warnBefore / 60000);
-        this.pushIfDirty(`T-${minsLeft}m checkpoint`)
-          .catch((err) => console.error('[checkpoint] TTL push failed:', err))
-          .finally(() => {
-            this.opts.notify(
-              `⏰ ${this.opts.beamAlias} expires in ${minsLeft} minutes. Work is pushed to ` +
-                `refs/agents/${this.opts.beamAlias}. Run \`tsh beams add\` and clone from there.`,
-            );
-          });
-      }, delay);
-      this.warnTimers.push(timer);
-    }
   }
 
   stop(): void {
     if (this.interval) clearInterval(this.interval);
-    for (const t of this.warnTimers) clearTimeout(t);
-    this.warnTimers = [];
+  }
+
+  /** Repoint future pushes at a new ref (e.g. after /rename). History on the old ref is left as-is. */
+  setRefName(refName: string): void {
+    this.opts.refName = refName;
   }
 
   force(reason = 'manual checkpoint'): Promise<boolean> {
@@ -59,7 +43,7 @@ export class Checkpoint {
   }
 
   private async pushIfDirty(reason: string): Promise<boolean> {
-    const { workDir, beamAlias } = this.opts;
+    const { workDir, refName } = this.opts;
     let status;
     try {
       status = await exec('git', ['status', '--porcelain'], { cwd: workDir });
@@ -70,7 +54,48 @@ export class Checkpoint {
 
     await exec('git', ['add', '-A'], { cwd: workDir });
     await exec('git', ['commit', '-m', `${reason} ${new Date().toISOString()}`], { cwd: workDir });
-    await exec('git', ['push', 'origin', `HEAD:refs/agents/${beamAlias}`], { cwd: workDir });
+    await exec('git', ['push', 'origin', `HEAD:${refName}`], { cwd: workDir });
     return true;
+  }
+}
+
+export interface TTLSchedulerOptions {
+  expiresAt: Date | null;
+  beamAlias: string;
+  notify: (text: string) => void;
+  /** Called at each warning threshold to get the current set of agents to force-push. */
+  getCheckpoints: () => Checkpoint[];
+}
+
+/** Beam-wide TTL warnings, decoupled from any one agent's periodic Checkpoint. */
+export class TTLScheduler {
+  private timers: NodeJS.Timeout[] = [];
+
+  constructor(private opts: TTLSchedulerOptions) {}
+
+  start(): void {
+    if (!this.opts.expiresAt) return;
+    const expiresAt = this.opts.expiresAt;
+    for (const warnBefore of WARN_AT_MS) {
+      const delay = expiresAt.getTime() - warnBefore - Date.now();
+      if (delay <= 0) continue;
+      const timer = setTimeout(() => {
+        const minsLeft = Math.round(warnBefore / 60000);
+        const checkpoints = this.opts.getCheckpoints();
+        Promise.all(checkpoints.map((cp) => cp.force(`T-${minsLeft}m checkpoint`).catch((err) => console.error('[ttl] push failed:', err))))
+          .finally(() => {
+            this.opts.notify(
+              `⏰ ${this.opts.beamAlias} expires in ${minsLeft} minutes. Work is pushed to ` +
+                `refs/agents/${this.opts.beamAlias}/*. Run \`tsh beams add\` and clone from there.`,
+            );
+          });
+      }, delay);
+      this.timers.push(timer);
+    }
+  }
+
+  stop(): void {
+    for (const t of this.timers) clearTimeout(t);
+    this.timers = [];
   }
 }
