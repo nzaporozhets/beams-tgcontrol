@@ -17,7 +17,7 @@ Wired into `.claude/settings.json`:
 | Hook event | Script | Purpose |
 |---|---|---|
 | `Notification` | `tg-notify.sh` | One-way ping when Claude wants permission or has gone idle. |
-| `PreToolUse` (`AskUserQuestion\|Bash`) | `tg-confirm.sh` | Forwards a permission prompt or multi-choice question to Telegram and turns your reply into the decision — no local UI needed. |
+| `PreToolUse` (`AskUserQuestion\|Bash\|Edit\|Write\|NotebookEdit\|WebFetch`) | `tg-confirm.sh` | Forwards a permission prompt or multi-choice question to Telegram and turns your reply into the decision — no local UI needed. |
 | `Stop` | `tg-wait.sh` | Posts the turn's summary, long-polls for your reply, and feeds free text back into the running session as its next instruction. |
 
 ## Scripts
@@ -34,10 +34,11 @@ Two-way, scoped to a single tool call.
   waits for a reply (`;`-separated per question if there's more than one),
   then blocks the tool call and hands your answer back to Claude as the
   block reason. The interactive question UI never appears locally.
-- **Everything else matched by the hook's matcher** (`Bash` by default) —
-  sends a yes/no confirmation and maps the reply to an `allow`/`deny`
-  permission decision. An unrecognized reply or a timeout falls through to
-  the normal local prompt.
+- **Everything else matched by the hook's matcher** (`Bash`, `Edit`,
+  `Write`, `NotebookEdit`, `WebFetch` by default) — sends a yes/no
+  confirmation and maps the reply to an `allow`/`deny` permission decision.
+  An unrecognized reply or a timeout falls through to the normal local
+  prompt.
 
 Shares `tg-wait.sh`'s update offset file so the two scripts never process
 the same Telegram message twice. Skips itself entirely when
@@ -72,3 +73,7 @@ Telegram commands recognized by the Stop hook:
 - Hook timeouts in `settings.json` must stay comfortably longer than each
   script's own `WAIT_SECONDS`/poll window, or Claude Code will kill the
   hook before a reply can arrive.
+- Claude Code loads hooks once at process start. Editing `settings.json`
+  never affects an already-running session — exit and start a new one
+  (`--resume <session-id>` if you want the history back) to pick up hook
+  changes.

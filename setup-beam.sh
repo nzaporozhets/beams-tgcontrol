@@ -66,7 +66,7 @@ jq \
      hooks: [{type:"command", command:$notify, timeout:20, statusMessage:"Pinging Telegram"}]
    }]
    | .hooks.PreToolUse = [{
-     matcher: "AskUserQuestion|Bash",
+     matcher: "AskUserQuestion|Bash|Edit|Write|NotebookEdit|WebFetch",
      hooks: [{type:"command", command:$confirm, timeout:90, statusMessage:"Asking Telegram"}]
    }]
    | .hooks.Stop = [{
